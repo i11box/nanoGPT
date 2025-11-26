@@ -11,9 +11,72 @@ import math
 import inspect
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+
+# -----------------------------------------------------------------------------
+# Diffusion utilities (ported and simplified from diffusion-forcing)
+# -----------------------------------------------------------------------------
+
+
+class SinusoidalPosEmb(nn.Module):
+    """Standard sinusoidal positional embedding used for diffusion time-step encodings."""
+
+    def __init__(self, dim, theta: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+
+    def forward(self, x):
+        # x: (...,) integer or float time-steps
+        device = x.device
+        half_dim = self.dim // 2
+        emb_factor = math.log(self.theta) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb_factor)  # (D/2,)
+        x = x.float().unsqueeze(-1)                                           # (..., 1)
+        emb = x * emb                                                         # (..., D/2)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)                       # (..., D)
+        return emb
+
+
+def linear_beta_schedule(timesteps: int):
+    """Linear schedule, as in the original DDPM paper."""
+    scale = 1000 / timesteps
+    beta_start = scale * 0.0001
+    beta_end = scale * 0.02
+    return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float64)
+
+
+def cosine_beta_schedule(timesteps: int, s: float = 0.008):
+    """Cosine schedule (https://openreview.net/forum?id=-NEXDKk8gZ)."""
+    steps = timesteps + 1
+    t = torch.linspace(0, timesteps, steps, dtype=torch.float64) / timesteps
+    alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
+
+
+def sigmoid_beta_schedule(
+    timesteps: int,
+    start: float = -3,
+    end: float = 3,
+    tau: float = 1,
+    clamp_min: float = 1e-5,
+):
+    """Sigmoid schedule (https://arxiv.org/abs/2212.11972, Figure 8)."""
+    steps = timesteps + 1
+    t = torch.linspace(0, timesteps, steps, dtype=torch.float64) / timesteps
+    v_start = torch.tensor(start / tau).sigmoid()
+    v_end = torch.tensor(end / tau).sigmoid()
+    alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    betas = torch.clip(betas, clamp_min, 0.999)
+    return betas
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -108,12 +171,23 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+    # Diffusion Forcing hyperparameters (used only in DFGPT)
+    df_timesteps: int = 32
+    df_sampling_timesteps: int = 32
+    df_snr_clip: float = 5.0
+    df_cum_snr_decay: float = 0.95
+    df_objective: str = "pred_noise"  # "pred_noise", "pred_x0", or "pred_v"
+    df_beta_schedule: str = "cosine"  # "linear", "cosine", "sigmoid"
+    df_clip_noise: float = 5.0
+    df_ddim_eta: float = 0.0
+    df_stabilization_level: int = 0
 
 class GPT(nn.Module):
 
@@ -328,3 +402,505 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+class DFGPT(GPT):
+    """
+    Diffusion Forcing variant of GPT.
+    Trains in continuous embedding space with per-token diffusion and fused SNR reweighting.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        # diffusion hyperparameters
+        self.df_timesteps = getattr(config, "df_timesteps", 32)
+        self.df_sampling_timesteps = getattr(config, "df_sampling_timesteps", self.df_timesteps)
+        self.df_snr_clip = getattr(config, "df_snr_clip", 5.0)
+        self.df_cum_snr_decay = getattr(config, "df_cum_snr_decay", 0.95)
+        self.df_objective = getattr(config, "df_objective", "pred_noise")
+        self.df_beta_schedule = getattr(config, "df_beta_schedule", "cosine")
+        self.df_clip_noise = getattr(config, "df_clip_noise", 5.0)
+        self.df_ddim_eta = getattr(config, "df_ddim_eta", 0.0)
+        self.df_stabilization_level = getattr(config, "df_stabilization_level", 0)
+
+        assert self.df_sampling_timesteps <= self.df_timesteps
+        self.df_is_ddim_sampling = self.df_sampling_timesteps < self.df_timesteps
+
+        # time-step embedding and prediction head (back to embedding space)
+        self.df_t_embed = SinusoidalPosEmb(self.config.n_embd)
+        self.df_head = nn.Linear(self.config.n_embd, self.config.n_embd, bias=True)
+
+        # precompute diffusion buffers (betas, alphas, SNR, etc.)
+        self._build_diffusion_buffers()
+
+    # --- diffusion utilities -------------------------------------------------
+
+    def _build_diffusion_buffers(self):
+        T = self.df_timesteps
+        # beta schedule (matches diffusion-forcing choices)
+        if self.df_beta_schedule == "linear":
+            betas = linear_beta_schedule(T)
+        elif self.df_beta_schedule == "cosine":
+            betas = cosine_beta_schedule(T)
+        elif self.df_beta_schedule == "sigmoid":
+            betas = sigmoid_beta_schedule(T)
+        else:
+            raise ValueError(f"unknown df_beta_schedule {self.df_beta_schedule}")
+
+        betas = betas.to(torch.float32)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+
+        self.register_buffer("df_betas", betas)
+        self.register_buffer("df_alphas_cumprod", alphas_cumprod)
+        self.register_buffer("df_alphas_cumprod_prev", alphas_cumprod_prev)
+
+        # posterior q(x_{t-1} | x_t, x_0)
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_log_variance_clipped = torch.log(posterior_variance.clamp(min=1e-20))
+        posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
+
+        self.register_buffer("df_posterior_variance", posterior_variance)
+        self.register_buffer("df_posterior_log_variance_clipped", posterior_log_variance_clipped)
+        self.register_buffer("df_posterior_mean_coef1", posterior_mean_coef1)
+        self.register_buffer("df_posterior_mean_coef2", posterior_mean_coef2)
+
+        # SNR and clipped SNR (for reweighting)
+        snr = alphas_cumprod / (1.0 - alphas_cumprod)
+        clipped_snr = snr.clone()
+        clipped_snr.clamp_(max=self.df_snr_clip)
+
+        self.register_buffer("df_snr", snr)
+        self.register_buffer("df_clipped_snr", clipped_snr)
+
+    def _extract(self, buf, t, x_shape):
+        # buf: (T,), t: (B, T_seq), return shape broadcastable to x_shape
+        out = buf[t]  # (B, T_seq)
+        while out.dim() < len(x_shape):
+            out = out.unsqueeze(-1)
+        return out
+
+    def _q_sample(self, x0, t, noise):
+        # x_t = sqrt(alpha_cumprod_t) * x0 + sqrt(1 - alpha_cumprod_t) * noise
+        sqrt_ac = torch.sqrt(self._extract(self.df_alphas_cumprod, t, x0.shape))
+        sqrt_om = torch.sqrt(1.0 - self._extract(self.df_alphas_cumprod, t, x0.shape))
+        return sqrt_ac * x0 + sqrt_om * noise
+
+    def _predict_start_from_noise(self, x_t, t, noise):
+        return (
+            self._extract(torch.sqrt(1.0 / self.df_alphas_cumprod), t, x_t.shape) * x_t
+            - self._extract(torch.sqrt(1.0 / self.df_alphas_cumprod - 1.0), t, x_t.shape) * noise
+        )
+
+    def _predict_noise_from_start(self, x_t, t, x0):
+        return (
+            self._extract(torch.sqrt(1.0 / self.df_alphas_cumprod), t, x_t.shape) * x_t - x0
+        ) / self._extract(torch.sqrt(1.0 / self.df_alphas_cumprod - 1.0), t, x_t.shape)
+
+    def _predict_v(self, x_start, t, noise):
+        sqrt_ac = self._extract(torch.sqrt(self.df_alphas_cumprod), t, x_start.shape)
+        sqrt_om = self._extract(torch.sqrt(1.0 - self.df_alphas_cumprod), t, x_start.shape)
+        return sqrt_ac * noise - sqrt_om * x_start
+
+    def _predict_start_from_v(self, x_t, t, v):
+        sqrt_ac = self._extract(torch.sqrt(self.df_alphas_cumprod), t, x_t.shape)
+        sqrt_om = self._extract(torch.sqrt(1.0 - self.df_alphas_cumprod), t, x_t.shape)
+        return sqrt_ac * x_t - sqrt_om * v
+
+    def _compute_loss_weight(self, noise_levels):
+        """
+        Fused SNR loss reweighting, adapted from Diffusion Forcing implementation.
+        noise_levels: (B, T_seq)
+        """
+        snr = self.df_snr[noise_levels]              # (B, T)
+        clipped_snr = self.df_clipped_snr[noise_levels]
+        normalized_clipped_snr = clipped_snr / self.df_snr_clip
+        normalized_snr = snr / self.df_snr_clip
+
+        # if not fused, fall back to min-SNR weighting
+        if self.df_cum_snr_decay <= 0.0:
+            if self.df_objective == "pred_noise":
+                return clipped_snr / snr
+            elif self.df_objective == "pred_x0":
+                return clipped_snr
+            elif self.df_objective == "pred_v":
+                return clipped_snr / (snr + 1.0)
+
+        # compute fused SNR along time dimension (tokens)
+        # work in (T, B) layout to mirror original implementation
+        normalized_clipped_tb = normalized_clipped_snr.transpose(0, 1)  # (T, B)
+        normalized_tb = normalized_snr.transpose(0, 1)                  # (T, B)
+        T, B = normalized_tb.shape
+
+        cum_snr_tb = torch.zeros_like(normalized_tb)
+        for t in range(T):
+            if t == 0:
+                cum_snr_tb[t] = normalized_clipped_tb[t]
+            else:
+                cum_snr_tb[t] = (
+                    self.df_cum_snr_decay * cum_snr_tb[t - 1]
+                    + (1.0 - self.df_cum_snr_decay) * normalized_clipped_tb[t]
+                )
+
+        cum_snr_tb = F.pad(cum_snr_tb[:-1], (0, 0, 1, 0), value=0.0)
+        clipped_fused_snr_tb = 1.0 - (1.0 - cum_snr_tb * self.df_cum_snr_decay) * (
+            1.0 - normalized_clipped_tb
+        )
+        fused_snr_tb = 1.0 - (1.0 - cum_snr_tb * self.df_cum_snr_decay) * (1.0 - normalized_tb)
+
+        if self.df_objective == "pred_noise":
+            weight_tb = clipped_fused_snr_tb / fused_snr_tb
+        elif self.df_objective == "pred_x0":
+            weight_tb = clipped_fused_snr_tb * self.df_snr_clip
+        elif self.df_objective == "pred_v":
+            weight_tb = clipped_fused_snr_tb * self.df_snr_clip / (fused_snr_tb * self.df_snr_clip + 1.0)
+        else:
+            raise ValueError(f"unknown df_objective {self.df_objective}")
+
+        return weight_tb.transpose(0, 1)  # back to (B, T)
+
+    def _add_shape_channels_seq(self, x_scalar, x_like):
+        """
+        Helper to broadcast scalar/tensor of shape (B, T) to match x_like shape (B, T, C)
+        by adding trailing singleton dimensions.
+        """
+        while x_scalar.dim() < x_like.dim():
+            x_scalar = x_scalar.unsqueeze(-1)
+        return x_scalar
+
+    # --- sampling (DDPM / DDIM) ----------------------------------------------
+
+    def _df_model_predictions_seq(self, x_seq, noise_levels_seq):
+        """
+        Wrapper for model predictions on sequences in (T, B, C) layout.
+        x_seq: (T, B, C), noise_levels_seq: (T, B)
+        """
+        x = x_seq.transpose(0, 1)                  # (B, T, C)
+        k = noise_levels_seq.transpose(0, 1)       # (B, T)
+        pred_noise, x_start, model_out = self._df_model_predictions(x, k)
+        return (
+            pred_noise.transpose(0, 1),
+            x_start.transpose(0, 1),
+            model_out.transpose(0, 1),
+        )
+
+    def _ddpm_sample_step_seq(self, x, curr_noise_level):
+        """
+        DDPM sampling step on sequence x with per-token noise level.
+        x: (T, B, C)
+        curr_noise_level: (T, B) in real steps (-1 .. timesteps-1)
+        """
+        clipped_curr = torch.where(
+            curr_noise_level < 0,
+            torch.full_like(curr_noise_level, self.df_stabilization_level - 1, dtype=torch.long),
+            curr_noise_level,
+        )
+
+        orig_x = x.clone().detach()
+        # treating as stabilization would require scaling with sqrt(alpha_cumprod)
+        scaled_context = self._q_sample(
+            x.transpose(0, 1),                     # (B, T, C)
+            clipped_curr.transpose(0, 1),          # (B, T)
+            noise=torch.randn_like(x.transpose(0, 1)),
+        ).transpose(0, 1)
+        x = torch.where(
+            self._add_shape_channels_seq(curr_noise_level < 0, x),
+            scaled_context,
+            orig_x,
+        )
+
+        # DDPM here does not support guidance for now (same as original DF code)
+        pred_noise, x_start, _ = self._df_model_predictions_seq(x, clipped_curr)
+        posterior_mean = (
+            self._extract(self.df_posterior_mean_coef1, clipped_curr.transpose(0, 1), x_start.transpose(0, 1))
+            * x_start.transpose(0, 1)
+            + self._extract(self.df_posterior_mean_coef2, clipped_curr.transpose(0, 1), x.transpose(0, 1))
+            * x.transpose(0, 1)
+        ).transpose(0, 1)
+        model_log_variance = self._extract(
+            self.df_posterior_log_variance_clipped, clipped_curr.transpose(0, 1), x.transpose(0, 1)
+        ).transpose(0, 1)
+
+        noise = torch.where(
+            self._add_shape_channels_seq(clipped_curr > 0, x),
+            torch.randn_like(x),
+            torch.zeros_like(x),
+        )
+        noise = torch.clamp(noise, -self.df_clip_noise, self.df_clip_noise)
+        x_pred = posterior_mean + torch.exp(0.5 * model_log_variance) * noise
+
+        return torch.where(
+            self._add_shape_channels_seq(curr_noise_level == -1, x),
+            orig_x,
+            x_pred,
+        )
+
+    def _ddim_sample_step_seq(self, x, curr_noise_level, next_noise_level):
+        """
+        DDIM sampling step on sequence x with per-token noise level.
+        x: (T, B, C)
+        curr_noise_level, next_noise_level: (T, B) in real steps (-1 .. timesteps-1)
+        """
+        clipped_curr = torch.where(
+            curr_noise_level < 0,
+            torch.full_like(curr_noise_level, self.df_stabilization_level - 1, dtype=torch.long),
+            curr_noise_level,
+        )
+
+        orig_x = x.clone().detach()
+        # stabilization: scale context according to current alpha_cumprod
+        x_bt = x.transpose(0, 1)
+        scaled_context_bt = self._q_sample(
+            x_bt,
+            clipped_curr.transpose(0, 1),
+            noise=torch.zeros_like(x_bt),
+        )
+        scaled_context = scaled_context_bt.transpose(0, 1)
+        x = torch.where(
+            self._add_shape_channels_seq(curr_noise_level < 0, x),
+            scaled_context,
+            orig_x,
+        )
+
+        alpha = self.df_alphas_cumprod[clipped_curr]                 # (T, B)
+        alpha_next = torch.where(
+            next_noise_level < 0,
+            torch.ones_like(next_noise_level),
+            self.df_alphas_cumprod[next_noise_level],
+        )
+        sigma = torch.where(
+            next_noise_level < 0,
+            torch.zeros_like(next_noise_level),
+            self.df_ddim_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt(),
+        )
+        c = (1 - alpha_next - sigma**2).sqrt()
+
+        alpha_next_shaped = self._add_shape_channels_seq(alpha_next, x)
+        c_shaped = self._add_shape_channels_seq(c, x)
+        sigma_shaped = self._add_shape_channels_seq(sigma, x)
+
+        # model predictions
+        pred_noise, x_start, _ = self._df_model_predictions_seq(x, clipped_curr)
+
+        noise = torch.randn_like(x)
+        noise = torch.clamp(noise, -self.df_clip_noise, self.df_clip_noise)
+        x_pred = x_start * alpha_next_shaped.sqrt() + pred_noise * c_shaped + sigma_shaped * noise
+
+        # only update positions where the noise level decreases
+        mask = curr_noise_level == next_noise_level
+        x_pred = torch.where(
+            self._add_shape_channels_seq(mask, x),
+            orig_x,
+            x_pred,
+        )
+
+        return x_pred
+
+    def _sample_step_seq(self, x, curr_noise_level, next_noise_level):
+        """
+        Unified sampling step (DDPM or DDIM) on sequence x.
+        x: (T, B, C)
+        curr_noise_level, next_noise_level: (T, B) in scheduling index space [0, df_sampling_timesteps]
+        """
+        # map scheduling indices (0..sampling_timesteps) to real diffusion steps (-1..timesteps-1)
+        real_steps = torch.linspace(
+            -1, self.df_timesteps - 1, steps=self.df_sampling_timesteps + 1, device=x.device
+        ).long()
+        curr_real = real_steps[curr_noise_level]
+        next_real = real_steps[next_noise_level]
+
+        if self.df_is_ddim_sampling:
+            return self._ddim_sample_step_seq(x, curr_real, next_real)
+
+        # DDPM sanity checks (parity with diffusion-forcing)
+        assert torch.all(
+            (curr_real - 1 == next_real) | ((curr_real == -1) & (next_real == -1))
+        ), "Wrong noise level given for ddpm sampling."
+        assert (
+            self.df_sampling_timesteps == self.df_timesteps
+        ), "sampling_timesteps should equal timesteps for ddpm sampling."
+
+        return self._ddpm_sample_step_seq(x, curr_real)
+
+    # --- scheduling matrix & DF-style generation -----------------------------
+
+    def _generate_scheduling_matrix(self, horizon: int, mode: str = "pyramid", uncertainty_scale: float = 1.0):
+        """
+        Generate scheduling matrix over a horizon, matching diffusion-forcing logic.
+        Returns an int64 numpy array of shape (height, horizon) with entries in [0, df_sampling_timesteps].
+        """
+        if mode == "pyramid":
+            height = self.df_sampling_timesteps + int((horizon - 1) * uncertainty_scale) + 1
+            scheduling_matrix = np.zeros((height, horizon), dtype=np.int64)
+            for m in range(height):
+                for t in range(horizon):
+                    scheduling_matrix[m, t] = self.df_sampling_timesteps + int(t * uncertainty_scale) - m
+            return np.clip(scheduling_matrix, 0, self.df_sampling_timesteps)
+        elif mode == "full_sequence":
+            return np.arange(self.df_sampling_timesteps, -1, -1, dtype=np.int64)[:, None].repeat(horizon, axis=1)
+        else:
+            raise ValueError(f"unknown scheduling mode {mode}")
+
+    @torch.no_grad()
+    def generate_df(
+        self,
+        idx,
+        max_new_tokens: int,
+        chunk_size: int = 0,
+        scheduling_mode: str = "pyramid",
+        uncertainty_scale: float = 1.0,
+    ):
+        """
+        Diffusion Forcing style generation with scheduling matrix + sliding window.
+        idx: (B, T_ctx) conditioning tokens
+        Returns: (B, T_ctx + max_new_tokens) generated token indices
+        """
+        self.eval()
+        device = idx.device
+        b, t_ctx = idx.size()
+        n_tokens = self.config.block_size
+
+        # initial context embeddings as clean x0
+        pos_ctx = torch.arange(0, t_ctx, dtype=torch.long, device=device)
+        tok_emb_ctx = self.transformer.wte(idx)
+        pos_emb_ctx = self.transformer.wpe(pos_ctx)
+        x0_ctx = tok_emb_ctx + pos_emb_ctx.unsqueeze(0)           # (B, T_ctx, C)
+        xs_pred = x0_ctx.transpose(0, 1).contiguous()             # (T_ctx, B, C)
+
+        curr_pos = t_ctx
+        total_len = t_ctx + max_new_tokens
+
+        while curr_pos < total_len:
+            # determine horizon for this chunk
+            if chunk_size > 0:
+                horizon = min(total_len - curr_pos, chunk_size)
+            else:
+                horizon = total_len - curr_pos
+
+            assert horizon <= n_tokens, "horizon exceeds model block_size."
+            scheduling_matrix = self._generate_scheduling_matrix(
+                horizon, mode=scheduling_mode, uncertainty_scale=uncertainty_scale
+            )
+
+            # initialize new chunk as noise
+            chunk = torch.randn((horizon, b, self.config.n_embd), device=device)
+            chunk = torch.clamp(chunk, -self.df_clip_noise, self.df_clip_noise)
+            xs_pred = torch.cat([xs_pred, chunk], dim=0)          # (T_ctx + generated, B, C)
+
+            # sliding window: only input the last n_tokens positions to the model
+            start_pos = max(0, curr_pos + horizon - n_tokens)
+
+            for m in range(scheduling_matrix.shape[0] - 1):
+                # build from/to noise levels (prefix zeros for context)
+                from_noise_levels = np.concatenate(
+                    (np.zeros((curr_pos,), dtype=np.int64), scheduling_matrix[m])
+                )[:, None].repeat(b, axis=1)                       # (curr_pos + horizon, B)
+                to_noise_levels = np.concatenate(
+                    (np.zeros((curr_pos,), dtype=np.int64), scheduling_matrix[m + 1])
+                )[:, None].repeat(b, axis=1)
+
+                from_noise_levels_t = torch.from_numpy(from_noise_levels).to(device=device, dtype=torch.long)
+                to_noise_levels_t = torch.from_numpy(to_noise_levels).to(device=device, dtype=torch.long)
+
+                xs_pred[start_pos:] = self._sample_step_seq(
+                    xs_pred[start_pos:],
+                    from_noise_levels_t[start_pos:],
+                    to_noise_levels_t[start_pos:],
+                )
+
+            curr_pos += horizon
+
+        # decode embeddings to tokens for the newly generated segment
+        full_emb = xs_pred.transpose(0, 1)                         # (B, T_total, C)
+        new_emb = full_emb[:, t_ctx : t_ctx + max_new_tokens, :]   # (B, max_new_tokens, C)
+        logits = self.lm_head(new_emb)                             # (B, max_new_tokens, V)
+        new_ids = torch.argmax(logits, dim=-1)                     # (B, max_new_tokens)
+
+        return torch.cat([idx, new_ids], dim=1)
+
+    def _df_model_predictions(self, x, noise_levels):
+        """
+        Core Diffusion Forcing model: predicts noise/x0/v from noised input x and noise_levels.
+        x: (B, T, C), noise_levels: (B, T)
+        """
+        b, t, _ = x.shape
+        # time-step embedding (for diffusion step)
+        t_embed = self.df_t_embed(noise_levels.view(-1))          # (B*T, C)
+        t_embed = t_embed.view(b, t, -1)                          # (B, T, C)
+        h = x + t_embed
+
+        # GPT backbone
+        h = self.transformer.drop(h)
+        for block in self.transformer.h:
+            h = block(h)
+        h = self.transformer.ln_f(h)                              # (B, T, C)
+
+        model_out = self.df_head(h)                               # (B, T, C)
+
+        if self.df_objective == "pred_noise":
+            pred_noise = torch.clamp(model_out, -self.df_clip_noise, self.df_clip_noise)
+            x_start = self._predict_start_from_noise(x, noise_levels, pred_noise)
+        elif self.df_objective == "pred_x0":
+            x_start = model_out
+            pred_noise = self._predict_noise_from_start(x, noise_levels, x_start)
+        elif self.df_objective == "pred_v":
+            v = model_out
+            x_start = self._predict_start_from_v(x, noise_levels, v)
+            pred_noise = self._predict_noise_from_start(x, noise_levels, x_start)
+        else:
+            raise ValueError(f"unknown df_objective {self.df_objective}")
+
+        return pred_noise, x_start, model_out
+
+    # --- training forward ----------------------------------------------------
+
+    def forward(self, idx, targets=None):
+        """
+        idx: (B, T) token indices
+        targets: unused (for API compatibility with GPT)
+        Returns:
+            logits: None
+            loss: scalar diffusion-forcing loss
+        """
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, (
+            f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        )
+
+        # clean token embeddings x0
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # (T,)
+        tok_emb = self.transformer.wte(idx)                        # (B, T, C)
+        pos_emb = self.transformer.wpe(pos)                        # (T, C)
+        x0 = tok_emb + pos_emb.unsqueeze(0)                        # (B, T, C)
+
+        # per-token noise levels and Gaussian noise
+        noise_levels = torch.randint(0, self.df_timesteps, (b, t), device=device)  # (B, T)
+        noise = torch.randn_like(x0)
+        noise = torch.clamp(noise, -self.df_clip_noise, self.df_clip_noise)
+
+        # diffuse x0 to x_t
+        x_t = self._q_sample(x0, noise_levels, noise)                                # (B, T, C)
+
+        # core DF model
+        pred_noise, x_start_pred, model_out = self._df_model_predictions(x_t, noise_levels)
+
+        if self.df_objective == "pred_noise":
+            target = noise
+        elif self.df_objective == "pred_x0":
+            target = x0
+        elif self.df_objective == "pred_v":
+            target = self._predict_v(x0, noise_levels, noise)
+        else:
+            raise ValueError(f"unknown df_objective {self.df_objective}")
+
+        mse = F.mse_loss(model_out, target.detach(), reduction="none")               # (B, T, C)
+        loss_weight = self._compute_loss_weight(noise_levels)                        # (B, T)
+        loss_weight = loss_weight.unsqueeze(-1)                                      # (B, T, 1)
+        loss = (mse * loss_weight).mean()
+
+        # keep API identical to GPT
+        return None, loss
