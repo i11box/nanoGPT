@@ -1,26 +1,21 @@
 """
-Sample from a trained model
+Test if Diffusion Forcing model can "copy" input when noise_level = 0
 """
 import os
 import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from model import GPTConfig, GPT, DFGPT
+from nanoGPT.model import GPTConfig, GPT, DFGPT
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
+out_dir = '/inspire/ssd/project/video-generation/public/hyr/out-webnovel' # ignored if init_from is not 'resume'
+test_text = "叶秋深吸了一口气"  # Test input
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
+use_diffusion_forcing = True
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
-exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
@@ -37,17 +32,7 @@ if init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
-
-    # decide whether this checkpoint used Diffusion Forcing
-    ckpt_config = checkpoint.get('config', {})
-    ckpt_use_diffusion_forcing = ckpt_config.get('use_diffusion_forcing', False)
-    if ckpt_use_diffusion_forcing:
-        print("Loading Diffusion Forcing GPT (DFGPT) checkpoint for sampling.")
-        model = DFGPT(gptconf)
-    else:
-        print("Loading standard GPT checkpoint for sampling.")
-        model = GPT(gptconf)
-
+    model = DFGPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
@@ -60,8 +45,6 @@ elif init_from.startswith('gpt2'):
 
 model.eval()
 model.to(device)
-if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
 # look for the meta pickle in case it is available in the dataset folder
 load_meta = False
@@ -83,22 +66,40 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+# encode test input
+test_ids = encode(test_text)
+x = torch.tensor(test_ids, dtype=torch.long, device=device)[None, ...]  # (1, T)
 
-# run generation
+print(f"Input text: '{test_text}'")
+print(f"Input tokens: {test_ids}")
+print(f"Input tensor shape: {x.shape}")
+
+# Test copy ability
 with torch.no_grad():
     with ctx:
-        for k in range(num_samples):
-            # if this is a Diffusion Forcing model, use DF-style sampling;
-            # otherwise fall back to standard autoregressive sampling
-            if isinstance(model, DFGPT):
-                y = model.generate_df(x, max_new_tokens)
+        if hasattr(model, 'test_copy_ability'):  # DFGPT has this method
+            print("\n=== Testing Diffusion Forcing Copy Ability ===")
+            pred_tokens, mse_loss, x0, x_start_pred = model.test_copy_ability(x)
+
+            print(f"MSE between input embedding and predicted embedding: {mse_loss:.6f}")
+            print(f"Predicted tokens: {pred_tokens[0].tolist()}")
+            print(f"Decoded prediction: '{decode(pred_tokens[0].tolist())}'")
+
+            # Check if tokens match
+            input_tokens = x[0].tolist()
+            pred_tokens_list = pred_tokens[0].tolist()
+            token_match = input_tokens == pred_tokens_list
+            print(f"Token-level match: {token_match}")
+
+            if token_match:
+                print("✅ SUCCESS: Model can perfectly copy input when noise_level=0")
             else:
-                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+                print("❌ FAILURE: Model cannot copy input correctly")
+                print("This suggests issues with:")
+                print("  1. Output layer (df_head) dimensions")
+                print("  2. Missing ReLU that clips negative values")
+                print("  3. Missing normalization (e.g., divide by sqrt(d_model))")
+                print("  4. Wrong objective setting")
+
+        else:
+            print("Model does not have test_copy_ability method (probably standard GPT)")

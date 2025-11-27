@@ -178,9 +178,22 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    # create the model
+
+    # decide whether this checkpoint used Diffusion Forcing
+    ckpt_config = checkpoint.get('config', {})
+    ckpt_use_diffusion_forcing = ckpt_config.get('use_diffusion_forcing', False)
+    if ckpt_use_diffusion_forcing:
+        print("Checkpoint was trained with Diffusion Forcing (DFGPT).")
+    else:
+        print("Checkpoint was trained with standard Teacher Forcing GPT.")
+
+    # create the appropriate model class
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    if ckpt_use_diffusion_forcing:
+        model = DFGPT(gptconf)
+    else:
+        model = GPT(gptconf)
+
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more

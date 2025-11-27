@@ -415,7 +415,7 @@ class DFGPT(GPT):
 
         # diffusion hyperparameters
         self.df_timesteps = getattr(config, "df_timesteps", 32)
-        self.df_sampling_timesteps = getattr(config, "df_sampling_timesteps", self.df_timesteps)
+        self.df_sampling_timesteps = getattr(config, "df_sampling_timesteps", 32)
         self.df_snr_clip = getattr(config, "df_snr_clip", 5.0)
         self.df_cum_snr_decay = getattr(config, "df_cum_snr_decay", 0.95)
         self.df_objective = getattr(config, "df_objective", "pred_noise")
@@ -614,14 +614,16 @@ class DFGPT(GPT):
 
         # DDPM here does not support guidance for now (same as original DF code)
         pred_noise, x_start, _ = self._df_model_predictions_seq(x, clipped_curr)
+        # print(f'self.df_posterior_mean_coef1 shape:{self.df_posterior_mean_coef1.shape}, clipped_curr.transpose(0, 1).shape:{clipped_curr.transpose(0, 1).shape}, x_start.transpose(0, 1) shape:{x_start.transpose(0, 1).shape}')
+        x_start_bt = x_start.transpose(0, 1)
+        x_bt = x.transpose(0, 1)
+        t_bt = clipped_curr.transpose(0, 1)
         posterior_mean = (
-            self._extract(self.df_posterior_mean_coef1, clipped_curr.transpose(0, 1), x_start.transpose(0, 1))
-            * x_start.transpose(0, 1)
-            + self._extract(self.df_posterior_mean_coef2, clipped_curr.transpose(0, 1), x.transpose(0, 1))
-            * x.transpose(0, 1)
+            self._extract(self.df_posterior_mean_coef1, t_bt, x_start_bt.shape) * x_start_bt
+            + self._extract(self.df_posterior_mean_coef2, t_bt, x_bt.shape) * x_bt
         ).transpose(0, 1)
         model_log_variance = self._extract(
-            self.df_posterior_log_variance_clipped, clipped_curr.transpose(0, 1), x.transpose(0, 1)
+            self.df_posterior_log_variance_clipped, t_bt, x_bt.shape
         ).transpose(0, 1)
 
         noise = torch.where(
@@ -715,7 +717,7 @@ class DFGPT(GPT):
         if self.df_is_ddim_sampling:
             return self._ddim_sample_step_seq(x, curr_real, next_real)
 
-        # DDPM sanity checks (parity with diffusion-forcing)
+        # DDPM sanity checks (parity with diffusion-forcing)            
         assert torch.all(
             (curr_real - 1 == next_real) | ((curr_real == -1) & (next_real == -1))
         ), "Wrong noise level given for ddpm sampling."
@@ -733,12 +735,38 @@ class DFGPT(GPT):
         Returns an int64 numpy array of shape (height, horizon) with entries in [0, df_sampling_timesteps].
         """
         if mode == "pyramid":
-            height = self.df_sampling_timesteps + int((horizon - 1) * uncertainty_scale) + 1
-            scheduling_matrix = np.zeros((height, horizon), dtype=np.int64)
-            for m in range(height):
+            if not self.df_is_ddim_sampling:
+                # DDPM mode: ensure strict "step-by-step" constraint
+                # Each token must have noise levels that decrease by exactly 1 per row
+                # Start from the maximum noise level for each token position
+                max_noise_per_token = np.array([
+                    self.df_sampling_timesteps + int(t * uncertainty_scale)
+                    for t in range(horizon)
+                ], dtype=np.int64)
+                # Clip to valid range
+                max_noise_per_token = np.clip(max_noise_per_token, 0, self.df_sampling_timesteps)
+                
+                # Calculate height: need enough rows to go from max noise to 0 for each token
+                max_start_noise = max_noise_per_token.max()
+                height = max_start_noise + 2  # +2 to include 0 and ensure we can finish
+                
+                scheduling_matrix = np.zeros((height, horizon), dtype=np.int64)
                 for t in range(horizon):
-                    scheduling_matrix[m, t] = self.df_sampling_timesteps + int(t * uncertainty_scale) - m
-            return np.clip(scheduling_matrix, 0, self.df_sampling_timesteps)
+                    start_noise = max_noise_per_token[t]
+                    # For each row m, noise level = max(0, start_noise - m)
+                    # This ensures strict -1 per row constraint
+                    for m in range(height):
+                        scheduling_matrix[m, t] = max(0, start_noise - m)
+                
+                return scheduling_matrix
+            else:
+                # DDIM mode: more flexible scheduling allowed
+                height = self.df_sampling_timesteps + int((horizon - 1) * uncertainty_scale) + 1
+                scheduling_matrix = np.zeros((height, horizon), dtype=np.int64)
+                for m in range(height):
+                    for t in range(horizon):
+                        scheduling_matrix[m, t] = self.df_sampling_timesteps + int(t * uncertainty_scale) - m
+                return np.clip(scheduling_matrix, 0, self.df_sampling_timesteps)
         elif mode == "full_sequence":
             return np.arange(self.df_sampling_timesteps, -1, -1, dtype=np.int64)[:, None].repeat(horizon, axis=1)
         else:
@@ -775,12 +803,13 @@ class DFGPT(GPT):
 
         while curr_pos < total_len:
             # determine horizon for this chunk
-            if chunk_size > 0:
-                horizon = min(total_len - curr_pos, chunk_size)
-            else:
-                horizon = total_len - curr_pos
+            effective_chunk_size = chunk_size if chunk_size > 0 else n_tokens
+            horizon = min(total_len - curr_pos, effective_chunk_size)
 
-            assert horizon <= n_tokens, "horizon exceeds model block_size."
+            assert horizon <= n_tokens, (
+                f"horizon={horizon}, total_len={total_len},curr_pos={curr_pos}, "
+                f"chunk_size={chunk_size}, n_tokens={n_tokens} , horizon exceeds model block_size."
+            )
             scheduling_matrix = self._generate_scheduling_matrix(
                 horizon, mode=scheduling_mode, uncertainty_scale=uncertainty_scale
             )
@@ -912,3 +941,93 @@ class DFGPT(GPT):
         """
         _, loss = super().forward(idx, targets)
         return loss
+    
+    #---------test methods--------------
+    @torch.no_grad()
+    def test_copy_ability(self, idx):
+        """
+        Test if model can "copy" input when noise_level = 0.
+        idx: (B, T) token indices
+        Returns: predicted tokens, mse between input and predicted embeddings
+        """
+        self.eval()
+        device = idx.device
+        b, t = idx.size()
+
+        # Create clean embeddings x0
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        tok_emb = self.transformer.wte(idx)                        # (B, T, C)
+        pos_emb = self.transformer.wpe(pos)                        # (T, C)
+        x0 = tok_emb + pos_emb.unsqueeze(0)                        # (B, T, C)
+
+        # Set noise_levels = 0 (no noise added)
+        noise_levels = torch.zeros((b, t), dtype=torch.long, device=device)  # (B, T)
+
+        # x_t = x0 (since noise_level=0 means no diffusion)
+        x_t = x0
+
+        # Model prediction
+        pred_noise, x_start_pred, model_out = self._df_model_predictions(x_t, noise_levels)
+
+        # Check if x_start_pred is close to x0
+        mse_loss = F.mse_loss(x_start_pred, x0).item()
+
+        # Decode to tokens
+        if self.df_objective == "pred_x0":
+            predicted_emb = x_start_pred
+        else:
+            predicted_emb = x_start_pred  # Use predicted x_start for decoding
+
+        logits = self.lm_head(predicted_emb)                       # (B, T, V)
+        pred_tokens = torch.argmax(logits, dim=-1)                # (B, T)
+
+        return pred_tokens, mse_loss, x0, x_start_pred
+
+    @torch.no_grad()
+    def teacher_forcing_loss(self, idx, targets):
+        """
+        Return the standard GPT cross-entropy loss for logging / comparison.
+        """
+        _, loss = super().forward(idx, targets)
+        return loss
+    
+    #---------test methods--------------
+    @torch.no_grad()
+    def test_copy_ability(self, idx):
+        """
+        Test if model can "copy" input when noise_level = 0.
+        idx: (B, T) token indices
+        Returns: predicted tokens, mse between input and predicted embeddings
+        """
+        self.eval()
+        device = idx.device
+        b, t = idx.size()
+
+        # Create clean embeddings x0
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        tok_emb = self.transformer.wte(idx)                        # (B, T, C)
+        pos_emb = self.transformer.wpe(pos)                        # (T, C)
+        x0 = tok_emb + pos_emb.unsqueeze(0)                        # (B, T, C)
+
+        # Set noise_levels = 0 (no noise added)
+        noise_levels = torch.zeros((b, t), dtype=torch.long, device=device)  # (B, T)
+
+        # x_t = x0 (since noise_level=0 means no diffusion)
+        x_t = x0
+
+        # Model prediction
+        pred_noise, x_start_pred, model_out = self._df_model_predictions(x_t, noise_levels)
+
+        # Check if x_start_pred is close to x0
+        mse_loss = F.mse_loss(x_start_pred, x0).item()
+
+        # Decode to tokens
+        if self.df_objective == "pred_x0":
+            predicted_emb = x_start_pred
+        else:
+            predicted_emb = x_start_pred  # Use predicted x_start for decoding
+
+        logits = self.lm_head(predicted_emb)                       # (B, T, V)
+        pred_tokens = torch.argmax(logits, dim=-1)                # (B, T)
+
+        return pred_tokens, mse_loss, x0, x_start_pred
