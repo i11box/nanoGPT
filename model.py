@@ -837,9 +837,21 @@ class DFGPT(GPT):
                 horizon, mode=scheduling_mode, uncertainty_scale=uncertainty_scale
             )
 
-            # initialize new chunk as noise
-            chunk = torch.randn((horizon, b, self.config.n_embd), device=device)
-            chunk = torch.clamp(chunk, -self.df_clip_noise, self.df_clip_noise)
+            # initialize new chunk as noise with position embedding
+            chunk_noise = torch.randn((horizon, b, self.config.n_embd), device=device)
+            chunk_noise = torch.clamp(chunk_noise, -self.df_clip_noise, self.df_clip_noise)
+            
+            # Add position embedding to the new chunk
+            # The new chunk represents positions [curr_pos, curr_pos + horizon)
+            chunk_positions = torch.arange(curr_pos, curr_pos + horizon, dtype=torch.long, device=device)
+            # Use modulo to handle positions beyond block_size
+            chunk_positions = chunk_positions % self.config.block_size
+            pos_emb_chunk = self.transformer.wpe(chunk_positions)  # (horizon, C)
+            scale = math.sqrt(self.config.n_embd)
+            # Add position embedding to noise (this gives the chunk a "sense" of its position)
+            chunk = (chunk_noise.transpose(0, 1) + pos_emb_chunk.unsqueeze(0)) * scale  # (B, horizon, C)
+            chunk = chunk.transpose(0, 1)  # (horizon, B, C)
+            
             xs_pred = torch.cat([xs_pred, chunk], dim=0)          # (T_ctx + generated, B, C)
 
             # sliding window: only input the last n_tokens positions to the model
@@ -869,12 +881,27 @@ class DFGPT(GPT):
         full_emb = xs_pred.transpose(0, 1)                         # (B, T_total, C)
         new_emb = full_emb[:, t_ctx : t_ctx + max_new_tokens, :]   # (B, max_new_tokens, C)
         
-        # generate position embedding
+        print(f"DEBUG generate_df: t_ctx={t_ctx}, max_new_tokens={max_new_tokens}")
+        print(f"DEBUG generate_df: full_emb shape={full_emb.shape}, new_emb shape={new_emb.shape}")
+        print(f"DEBUG generate_df: new_emb min={new_emb.min().item():.4f}, max={new_emb.max().item():.4f}")
+        print(f"DEBUG generate_df: new_emb has NaN={torch.isnan(new_emb).any().item()}")
+        print(f"DEBUG generate_df: new_emb has Inf={torch.isinf(new_emb).any().item()}")
+        
+        # generate position embedding - must match the positions used during generation
+        # The new tokens were generated at positions [t_ctx, t_ctx + max_new_tokens)
+        # with modulo applied to stay within block_size
         pos_new = torch.arange(t_ctx, t_ctx + max_new_tokens, dtype=torch.long, device=device)
+        pos_new = pos_new % self.config.block_size  # Apply modulo like in generation
+        print(f"DEBUG generate_df: pos_new min={pos_new.min().item()}, max={pos_new.max().item()}")
+        
         scale = math.sqrt(self.config.n_embd)
         pos_emb_new = self.transformer.wpe(pos_new)
         pos_emb_new_scaled = pos_emb_new.unsqueeze(0) * scale
         pure_new_emb = new_emb - pos_emb_new_scaled
+        
+        print(f"DEBUG generate_df: pure_new_emb min={pure_new_emb.min().item():.4f}, max={pure_new_emb.max().item():.4f}")
+        print(f"DEBUG generate_df: pure_new_emb has NaN={torch.isnan(pure_new_emb).any().item()}")
+        print(f"DEBUG generate_df: pure_new_emb has Inf={torch.isinf(pure_new_emb).any().item()}")
         
         # logits = self.lm_head(new_emb)                             # (B, max_new_tokens, V)
         new_ids = self._decode_tokens(pure_new_emb)
@@ -964,6 +991,7 @@ class DFGPT(GPT):
         loss_weight = self._compute_loss_weight(noise_levels)                        # (B, T)
         loss_weight = loss_weight.unsqueeze(-1)                                      # (B, T, 1)
         loss = (mse * loss_weight).mean()
+        # loss = 0
 
         # TODO: 辅助交叉熵损失
         scale = math.sqrt(self.config.n_embd)
@@ -975,7 +1003,7 @@ class DFGPT(GPT):
         # 3. 混合 Loss
         # 给 CE Loss 一个权重 (lambda)，通常 0.1 或 1.0 都可以
         # 这个 Loss 会提供极其鲜明的梯度，强迫模型把字"对准"
-        loss += 0.5 * ce_loss
+        loss += 1 * ce_loss
 
         # keep API identical to GPT
         return None, loss
@@ -1039,9 +1067,18 @@ class DFGPT(GPT):
         使用欧氏距离 (L2 Distance) 解码
         embedding: (B, T, C)
         """
+        # DEBUG: 检查输入
+        print(f"DEBUG _decode_tokens: embedding shape={embedding.shape}")
+        print(f"DEBUG _decode_tokens: embedding min={embedding.min().item():.4f}, max={embedding.max().item():.4f}")
+        print(f"DEBUG _decode_tokens: embedding has NaN={torch.isnan(embedding).any().item()}")
+        print(f"DEBUG _decode_tokens: embedding has Inf={torch.isinf(embedding).any().item()}")
+        
         # 1. 获取 Embedding 权重并缩放 (如果你在 forward 里乘了 scale，这里也要乘)
         scale = math.sqrt(self.config.n_embd)
         w = self.transformer.wte.weight * scale # (V, C)
+        
+        print(f"DEBUG _decode_tokens: w shape={w.shape}, vocab_size={self.config.vocab_size}")
+        print(f"DEBUG _decode_tokens: w min={w.min().item():.4f}, max={w.max().item():.4f}")
         
         # 2. 计算距离
         # embedding: (B, T, C)
