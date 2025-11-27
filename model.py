@@ -599,29 +599,40 @@ class DFGPT(GPT):
             curr_noise_level,
         )
 
+        # ==========================================
+        # 【关键修复】创建 >=0 的安全索引，防止 CUDA 崩溃
+        # ==========================================
+        # 如果索引是 -1，我们在查表时强行视为 0。
+        # 虽然查出来的值是错的，但稍后会被 torch.where 丢弃，所以是安全的。
+        safe_curr = torch.clamp(clipped_curr, min=0)
+
         orig_x = x.clone().detach()
-        # treating as stabilization would require scaling with sqrt(alpha_cumprod)
+        
+        # 使用 safe_curr 而不是 clipped_curr 去查表
         scaled_context = self._q_sample(
             x.transpose(0, 1),                     # (B, T, C)
-            clipped_curr.transpose(0, 1),          # (B, T)
+            safe_curr.transpose(0, 1),             # (B, T) <--- 使用安全索引
             noise=torch.randn_like(x.transpose(0, 1)),
         ).transpose(0, 1)
+        
         x = torch.where(
             self._add_shape_channels_seq(curr_noise_level < 0, x),
             scaled_context,
             orig_x,
         )
 
-        # DDPM here does not support guidance for now (same as original DF code)
-        pred_noise, x_start, _ = self._df_model_predictions_seq(x, clipped_curr)
-        # print(f'self.df_posterior_mean_coef1 shape:{self.df_posterior_mean_coef1.shape}, clipped_curr.transpose(0, 1).shape:{clipped_curr.transpose(0, 1).shape}, x_start.transpose(0, 1) shape:{x_start.transpose(0, 1).shape}')
+        # 使用 safe_curr 预测
+        pred_noise, x_start, _ = self._df_model_predictions_seq(x, safe_curr) # <--- 使用安全索引
+
         x_start_bt = x_start.transpose(0, 1)
         x_bt = x.transpose(0, 1)
-        t_bt = clipped_curr.transpose(0, 1)
+        t_bt = safe_curr.transpose(0, 1) # <--- 使用安全索引
+
         posterior_mean = (
             self._extract(self.df_posterior_mean_coef1, t_bt, x_start_bt.shape) * x_start_bt
             + self._extract(self.df_posterior_mean_coef2, t_bt, x_bt.shape) * x_bt
         ).transpose(0, 1)
+        
         model_log_variance = self._extract(
             self.df_posterior_log_variance_clipped, t_bt, x_bt.shape
         ).transpose(0, 1)
@@ -634,6 +645,7 @@ class DFGPT(GPT):
         noise = torch.clamp(noise, -self.df_clip_noise, self.df_clip_noise)
         x_pred = posterior_mean + torch.exp(0.5 * model_log_variance) * noise
 
+        # 最后把那些原本是 -1 的位置还原回 orig_x (Clean)
         return torch.where(
             self._add_shape_channels_seq(curr_noise_level == -1, x),
             orig_x,
@@ -643,8 +655,6 @@ class DFGPT(GPT):
     def _ddim_sample_step_seq(self, x, curr_noise_level, next_noise_level):
         """
         DDIM sampling step on sequence x with per-token noise level.
-        x: (T, B, C)
-        curr_noise_level, next_noise_level: (T, B) in real steps (-1 .. timesteps-1)
         """
         clipped_curr = torch.where(
             curr_noise_level < 0,
@@ -652,12 +662,19 @@ class DFGPT(GPT):
             curr_noise_level,
         )
 
+        # ==========================================
+        # 【关键修复】安全索引
+        # ==========================================
+        safe_curr = torch.clamp(clipped_curr, min=0)
+        safe_next = torch.clamp(next_noise_level, min=0) # next 也要防 -1
+
         orig_x = x.clone().detach()
-        # stabilization: scale context according to current alpha_cumprod
+        
+        # 使用 safe_curr 查表
         x_bt = x.transpose(0, 1)
         scaled_context_bt = self._q_sample(
             x_bt,
-            clipped_curr.transpose(0, 1),
+            safe_curr.transpose(0, 1),
             noise=torch.zeros_like(x_bt),
         )
         scaled_context = scaled_context_bt.transpose(0, 1)
@@ -667,15 +684,20 @@ class DFGPT(GPT):
             orig_x,
         )
 
-        alpha = self.df_alphas_cumprod[clipped_curr]                 # (T, B)
+        # 使用 safe_curr / safe_next 查表
+        alpha = self.df_alphas_cumprod[safe_curr]                # (T, B)
+        
+        # 处理 alpha_next：如果 next < 0，不论查表结果如何，直接设为 1.0
+        alpha_next_temp = self.df_alphas_cumprod[safe_next]
         alpha_next = torch.where(
             next_noise_level < 0,
-            torch.ones_like(next_noise_level),
-            self.df_alphas_cumprod[next_noise_level],
+            torch.ones_like(next_noise_level, dtype=alpha_next_temp.dtype), # 修正：<0 时 alpha=1.0
+            alpha_next_temp,
         )
+        
         sigma = torch.where(
             next_noise_level < 0,
-            torch.zeros_like(next_noise_level),
+            torch.zeros_like(next_noise_level, dtype=alpha.dtype),
             self.df_ddim_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt(),
         )
         c = (1 - alpha_next - sigma**2).sqrt()
@@ -684,14 +706,13 @@ class DFGPT(GPT):
         c_shaped = self._add_shape_channels_seq(c, x)
         sigma_shaped = self._add_shape_channels_seq(sigma, x)
 
-        # model predictions
-        pred_noise, x_start, _ = self._df_model_predictions_seq(x, clipped_curr)
+        # 使用 safe_curr 预测
+        pred_noise, x_start, _ = self._df_model_predictions_seq(x, safe_curr)
 
         noise = torch.randn_like(x)
         noise = torch.clamp(noise, -self.df_clip_noise, self.df_clip_noise)
         x_pred = x_start * alpha_next_shaped.sqrt() + pred_noise * c_shaped + sigma_shaped * noise
 
-        # only update positions where the noise level decreases
         mask = curr_noise_level == next_noise_level
         x_pred = torch.where(
             self._add_shape_channels_seq(mask, x),
@@ -795,7 +816,9 @@ class DFGPT(GPT):
         pos_ctx = torch.arange(0, t_ctx, dtype=torch.long, device=device)
         tok_emb_ctx = self.transformer.wte(idx)
         pos_emb_ctx = self.transformer.wpe(pos_ctx)
-        x0_ctx = tok_emb_ctx + pos_emb_ctx.unsqueeze(0)           # (B, T_ctx, C)
+        scale = math.sqrt(self.config.n_embd)
+        x0_ctx = (tok_emb_ctx + pos_emb_ctx.unsqueeze(0)) * scale
+        # x0_ctx = tok_emb_ctx + pos_emb_ctx.unsqueeze(0)           # (B, T_ctx, C)
         xs_pred = x0_ctx.transpose(0, 1).contiguous()             # (T_ctx, B, C)
 
         curr_pos = t_ctx
@@ -845,8 +868,17 @@ class DFGPT(GPT):
         # decode embeddings to tokens for the newly generated segment
         full_emb = xs_pred.transpose(0, 1)                         # (B, T_total, C)
         new_emb = full_emb[:, t_ctx : t_ctx + max_new_tokens, :]   # (B, max_new_tokens, C)
-        logits = self.lm_head(new_emb)                             # (B, max_new_tokens, V)
-        new_ids = torch.argmax(logits, dim=-1)                     # (B, max_new_tokens)
+        
+        # generate position embedding
+        pos_new = torch.arange(t_ctx, t_ctx + max_new_tokens, dtype=torch.long, device=device)
+        scale = math.sqrt(self.config.n_embd)
+        pos_emb_new = self.transformer.wpe(pos_new)
+        pos_emb_new_scaled = pos_emb_new.unsqueeze(0) * scale
+        pure_new_emb = new_emb - pos_emb_new_scaled
+        
+        # logits = self.lm_head(new_emb)                             # (B, max_new_tokens, V)
+        new_ids = self._decode_tokens(pure_new_emb)
+        # new_ids = torch.argmax(logits, dim=-1)                     # (B, max_new_tokens)
 
         return torch.cat([idx, new_ids], dim=1)
 
@@ -903,8 +935,10 @@ class DFGPT(GPT):
         # clean token embeddings x0
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # (T,)
         tok_emb = self.transformer.wte(idx)                        # (B, T, C)
+        scale = math.sqrt(self.config.n_embd)
         pos_emb = self.transformer.wpe(pos)                        # (T, C)
-        x0 = tok_emb + pos_emb.unsqueeze(0)                        # (B, T, C)
+        x0 = (tok_emb + pos_emb.unsqueeze(0)) * scale
+        # x0 = tok_emb + pos_emb.unsqueeze(0)                        # (B, T, C)
 
         # per-token noise levels and Gaussian noise
         noise_levels = torch.randint(0, self.df_timesteps, (b, t), device=device)  # (B, T)
@@ -931,6 +965,18 @@ class DFGPT(GPT):
         loss_weight = loss_weight.unsqueeze(-1)                                      # (B, T, 1)
         loss = (mse * loss_weight).mean()
 
+        # TODO: 辅助交叉熵损失
+        scale = math.sqrt(self.config.n_embd)
+        pred_logits = self.lm_head(x_start_pred / scale) 
+
+        # 计算标准的 GPT 分类 Loss
+        ce_loss = F.cross_entropy(pred_logits.view(-1, pred_logits.size(-1)), idx.view(-1))
+
+        # 3. 混合 Loss
+        # 给 CE Loss 一个权重 (lambda)，通常 0.1 或 1.0 都可以
+        # 这个 Loss 会提供极其鲜明的梯度，强迫模型把字"对准"
+        loss += 0.5 * ce_loss
+
         # keep API identical to GPT
         return None, loss
 
@@ -945,89 +991,64 @@ class DFGPT(GPT):
     #---------test methods--------------
     @torch.no_grad()
     def test_copy_ability(self, idx):
-        """
-        Test if model can "copy" input when noise_level = 0.
-        idx: (B, T) token indices
-        Returns: predicted tokens, mse between input and predicted embeddings
-        """
         self.eval()
         device = idx.device
         b, t = idx.size()
 
-        # Create clean embeddings x0
+        # --- 修正开始 ---
         pos = torch.arange(0, t, dtype=torch.long, device=device)
-        tok_emb = self.transformer.wte(idx)                        # (B, T, C)
-        pos_emb = self.transformer.wpe(pos)                        # (T, C)
-        x0 = tok_emb + pos_emb.unsqueeze(0)                        # (B, T, C)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        
+        # 必须乘 scale！
+        scale = math.sqrt(self.config.n_embd)
+        x0 = (tok_emb + pos_emb.unsqueeze(0)) * scale
+        # === DEBUG PRINT ===
+        print(f"DEBUG: x0 mean: {x0.mean().item():.4f}, std: {x0.std().item():.4f}")
+        print(f"DEBUG: x0 norm (magnitude): {x0.norm(dim=-1).mean().item():.4f}")
+        # ===================
+        # --- 修正结束 ---
 
-        # Set noise_levels = 0 (no noise added)
-        noise_levels = torch.zeros((b, t), dtype=torch.long, device=device)  # (B, T)
+        noise_levels = torch.zeros((b, t), dtype=torch.long, device=device)
+        x_t = x0 # noise=0, so input is clean
 
-        # x_t = x0 (since noise_level=0 means no diffusion)
-        x_t = x0
-
-        # Model prediction
         pred_noise, x_start_pred, model_out = self._df_model_predictions(x_t, noise_levels)
-
-        # Check if x_start_pred is close to x0
+        
         mse_loss = F.mse_loss(x_start_pred, x0).item()
 
-        # Decode to tokens
+        # Decode
         if self.df_objective == "pred_x0":
             predicted_emb = x_start_pred
         else:
-            predicted_emb = x_start_pred  # Use predicted x_start for decoding
-
-        logits = self.lm_head(predicted_emb)                       # (B, T, V)
-        pred_tokens = torch.argmax(logits, dim=-1)                # (B, T)
+            # 如果是预测 noise，我们需要从 x_t (即 x0) 减去预测的 noise (应该是0) 恢复 x_start
+            # 在 test_copy_ability 且 k=0 时，逻辑上 x_start_pred 应该就是结果
+            predicted_emb = x_start_pred
+        pos_emb_scaled = self.transformer.wpe(pos).unsqueeze(0) * scale
+        
+        # 1. 还原纯 Token 向量
+        pure_token_pred = x_start_pred - pos_emb_scaled
+        
+        # 2. 用这个纯向量去解码
+        pred_tokens = self._decode_tokens(pure_token_pred)
+        # pred_tokens = self._decode_tokens(predicted_emb)
 
         return pred_tokens, mse_loss, x0, x_start_pred
-
-    @torch.no_grad()
-    def teacher_forcing_loss(self, idx, targets):
-        """
-        Return the standard GPT cross-entropy loss for logging / comparison.
-        """
-        _, loss = super().forward(idx, targets)
-        return loss
     
-    #---------test methods--------------
-    @torch.no_grad()
-    def test_copy_ability(self, idx):
+    def _decode_tokens(self, embedding):
         """
-        Test if model can "copy" input when noise_level = 0.
-        idx: (B, T) token indices
-        Returns: predicted tokens, mse between input and predicted embeddings
+        使用欧氏距离 (L2 Distance) 解码
+        embedding: (B, T, C)
         """
-        self.eval()
-        device = idx.device
-        b, t = idx.size()
-
-        # Create clean embeddings x0
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-        tok_emb = self.transformer.wte(idx)                        # (B, T, C)
-        pos_emb = self.transformer.wpe(pos)                        # (T, C)
-        x0 = tok_emb + pos_emb.unsqueeze(0)                        # (B, T, C)
-
-        # Set noise_levels = 0 (no noise added)
-        noise_levels = torch.zeros((b, t), dtype=torch.long, device=device)  # (B, T)
-
-        # x_t = x0 (since noise_level=0 means no diffusion)
-        x_t = x0
-
-        # Model prediction
-        pred_noise, x_start_pred, model_out = self._df_model_predictions(x_t, noise_levels)
-
-        # Check if x_start_pred is close to x0
-        mse_loss = F.mse_loss(x_start_pred, x0).item()
-
-        # Decode to tokens
-        if self.df_objective == "pred_x0":
-            predicted_emb = x_start_pred
-        else:
-            predicted_emb = x_start_pred  # Use predicted x_start for decoding
-
-        logits = self.lm_head(predicted_emb)                       # (B, T, V)
-        pred_tokens = torch.argmax(logits, dim=-1)                # (B, T)
-
-        return pred_tokens, mse_loss, x0, x_start_pred
+        # 1. 获取 Embedding 权重并缩放 (如果你在 forward 里乘了 scale，这里也要乘)
+        scale = math.sqrt(self.config.n_embd)
+        w = self.transformer.wte.weight * scale # (V, C)
+        
+        # 2. 计算距离
+        # embedding: (B, T, C)
+        # w: (V, C) -> unsqueeze -> (1, V, C)
+        # cdist 支持广播: (B, T, C) vs (1, V, C) -> (B, T, V)
+        dists = torch.cdist(embedding, w.unsqueeze(0)) 
+        
+        # 3. 找最近邻
+        # 此时 dists 形状是 (B, T, V)，argmin 后是 (B, T)
+        return torch.argmin(dists, dim=-1)
