@@ -904,3 +904,11 @@ class DFGPT(GPT):
 
         # keep API identical to GPT
         return None, loss
+
+    @torch.no_grad()
+    def teacher_forcing_loss(self, idx, targets):
+        """
+        Return the standard GPT cross-entropy loss for logging / comparison.
+        """
+        _, loss = super().forward(idx, targets)
+        return loss

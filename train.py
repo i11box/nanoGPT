@@ -39,10 +39,9 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+# tensorboard logging
+tensorboard_log = False # disabled by default
+tensorboard_log_dir = 'runs/owt'
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -232,12 +231,19 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        ce_losses = torch.zeros(eval_iters)
+        base_model = model.module if hasattr(model, "module") else model
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                _, loss = model(X, Y)
+                if isinstance(base_model, DFGPT):
+                    ce_loss = base_model.teacher_forcing_loss(X, Y)
+                else:
+                    ce_loss = loss
             losses[k] = loss.item()
-        out[split] = losses.mean()
+            ce_losses[k] = ce_loss.item()
+        out[split] = {'loss': losses.mean(), 'ce': ce_losses.mean()}
     model.train()
     return out
 
@@ -256,9 +262,11 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+if tensorboard_log and master_process:
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir=tensorboard_log_dir)
+else:
+    writer = None
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -276,17 +284,21 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        train_stats = losses['train']
+        val_stats = losses['val']
+        print(
+            f"step {iter_num}: train loss {train_stats['loss']:.4f}, val loss {val_stats['loss']:.4f}, "
+            f"train CE {train_stats['ce']:.4f}, val CE {val_stats['ce']:.4f}"
+        )
+        if tensorboard_log and writer is not None:
+            writer.add_scalar("train/loss", train_stats['loss'], iter_num)
+            writer.add_scalar("val/loss", val_stats['loss'], iter_num)
+            writer.add_scalar("train/ce", train_stats['ce'], iter_num)
+            writer.add_scalar("val/ce", val_stats['ce'], iter_num)
+            writer.add_scalar("lr", lr, iter_num)
+            writer.add_scalar("mfu", running_mfu*100, iter_num) # convert to percentage
+        if val_stats['loss'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = val_stats['loss']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -348,3 +360,6 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+if writer is not None:
+    writer.close()
