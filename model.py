@@ -430,6 +430,9 @@ class DFGPT(GPT):
         # time-step embedding and prediction head (back to embedding space)
         self.df_t_embed = SinusoidalPosEmb(self.config.n_embd)
         self.df_head = nn.Linear(self.config.n_embd, self.config.n_embd, bias=True)
+        
+        # scale
+        self.scale = math.sqrt(self.config.n_embd)
 
         # precompute diffusion buffers (betas, alphas, SNR, etc.)
         self._build_diffusion_buffers()
@@ -644,7 +647,7 @@ class DFGPT(GPT):
         )
         noise = torch.clamp(noise, -self.df_clip_noise, self.df_clip_noise)
         x_pred = posterior_mean + torch.exp(0.5 * model_log_variance) * noise
-
+        # x_pred = x_pred.clamp(-self.scale*5, self.scale*5) # 裁剪，但是没啥用
         # 最后把那些原本是 -1 的位置还原回 orig_x (Clean)
         return torch.where(
             self._add_shape_channels_seq(curr_noise_level == -1, x),
@@ -816,8 +819,7 @@ class DFGPT(GPT):
         pos_ctx = torch.arange(0, t_ctx, dtype=torch.long, device=device)
         tok_emb_ctx = self.transformer.wte(idx)
         pos_emb_ctx = self.transformer.wpe(pos_ctx)
-        scale = math.sqrt(self.config.n_embd)
-        x0_ctx = (tok_emb_ctx + pos_emb_ctx.unsqueeze(0)) * scale
+        x0_ctx = (tok_emb_ctx + pos_emb_ctx.unsqueeze(0)) * self.scale
         # x0_ctx = tok_emb_ctx + pos_emb_ctx.unsqueeze(0)           # (B, T_ctx, C)
         xs_pred = x0_ctx.transpose(0, 1).contiguous()             # (T_ctx, B, C)
 
@@ -847,9 +849,8 @@ class DFGPT(GPT):
             # Use modulo to handle positions beyond block_size
             chunk_positions = chunk_positions % self.config.block_size
             pos_emb_chunk = self.transformer.wpe(chunk_positions)  # (horizon, C)
-            scale = math.sqrt(self.config.n_embd)
             # Add position embedding to noise (this gives the chunk a "sense" of its position)
-            chunk = (chunk_noise.transpose(0, 1) + pos_emb_chunk.unsqueeze(0)) * scale  # (B, horizon, C)
+            chunk = chunk_noise.transpose(0, 1) + pos_emb_chunk.unsqueeze(0) * self.scale  # (B, horizon, C)
             chunk = chunk.transpose(0, 1)  # (horizon, B, C)
             
             xs_pred = torch.cat([xs_pred, chunk], dim=0)          # (T_ctx + generated, B, C)
@@ -858,6 +859,7 @@ class DFGPT(GPT):
             start_pos = max(0, curr_pos + horizon - n_tokens)
 
             for m in range(scheduling_matrix.shape[0] - 1):
+                print(f'DEBUG generate_df: step {m}, xs_pred[start_pos:] min={xs_pred[start_pos:].min().item()}, max={xs_pred[start_pos:].max().item()}')
                 # build from/to noise levels (prefix zeros for context)
                 from_noise_levels = np.concatenate(
                     (np.zeros((curr_pos,), dtype=np.int64), scheduling_matrix[m])
@@ -894,10 +896,10 @@ class DFGPT(GPT):
         pos_new = pos_new % self.config.block_size  # Apply modulo like in generation
         print(f"DEBUG generate_df: pos_new min={pos_new.min().item()}, max={pos_new.max().item()}")
         
-        scale = math.sqrt(self.config.n_embd)
         pos_emb_new = self.transformer.wpe(pos_new)
-        pos_emb_new_scaled = pos_emb_new.unsqueeze(0) * scale
+        pos_emb_new_scaled = pos_emb_new.unsqueeze(0) * self.scale
         pure_new_emb = new_emb - pos_emb_new_scaled
+        pure_new_emb /= self.scale
         
         print(f"DEBUG generate_df: pure_new_emb min={pure_new_emb.min().item():.4f}, max={pure_new_emb.max().item():.4f}")
         print(f"DEBUG generate_df: pure_new_emb has NaN={torch.isnan(pure_new_emb).any().item()}")
@@ -941,43 +943,57 @@ class DFGPT(GPT):
         else:
             raise ValueError(f"unknown df_objective {self.df_objective}")
 
+        # clamp 
+        # x_start = x_start.clamp(-self.scale * 3, self.scale * 3)
+        
         return pred_noise, x_start, model_out
 
     # --- training forward ----------------------------------------------------
 
     def forward(self, idx, targets=None):
         """
-        idx: (B, T) token indices
-        targets: unused (for API compatibility with GPT)
-        Returns:
-            logits: None
-            loss: scalar diffusion-forcing loss
+        Modified forward pass incorporating AR-Diffusion best practices.
         """
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, (
-            f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        )
+        assert t <= self.config.block_size, f"Sequence too long"
 
-        # clean token embeddings x0
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # (T,)
-        tok_emb = self.transformer.wte(idx)                        # (B, T, C)
-        scale = math.sqrt(self.config.n_embd)
-        pos_emb = self.transformer.wpe(pos)                        # (T, C)
-        x0 = (tok_emb + pos_emb.unsqueeze(0)) * scale
-        # x0 = tok_emb + pos_emb.unsqueeze(0)                        # (B, T, C)
+        # ------------------------------------------------------------------
+        # 1. 准备 Input (Scaling 是重中之重)
+        # ------------------------------------------------------------------
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        
+        # 保存 scaled 的 pos_emb，后面算 Loss 要减掉它
+        pos_emb_scaled = pos_emb.unsqueeze(0) * self.scale 
+        
+        # x0 = (Token + Pos) * scale
+        x0 = (tok_emb + pos_emb.unsqueeze(0)) * self.scale
 
-        # per-token noise levels and Gaussian noise
-        noise_levels = torch.randint(0, self.df_timesteps, (b, t), device=device)  # (B, T)
+        # ------------------------------------------------------------------
+        # 2. 扩散过程 (Add Noise)
+        # ------------------------------------------------------------------
+        # 采样噪声水平
+        noise_levels = torch.randint(0, self.df_timesteps, (b, t), device=device)
+        
+        # AR-Diffusion 策略：为了强化重构能力，可以强制一定比例的样本为 t=0
+        # 这里为了简单暂不加，靠随机采样覆盖
+
         noise = torch.randn_like(x0)
+        # 截断噪声防止极端值破坏梯度
         noise = torch.clamp(noise, -self.df_clip_noise, self.df_clip_noise)
 
-        # diffuse x0 to x_t
-        x_t = self._q_sample(x0, noise_levels, noise)                                # (B, T, C)
+        # q_sample: x0 -> x_t
+        x_t = self._q_sample(x0, noise_levels, noise)
 
-        # core DF model
+        # ------------------------------------------------------------------
+        # 3. 模型预测 (Denoise)
+        # ------------------------------------------------------------------
+        # pred_noise, x_start_pred (这是预测的 x0), model_out
         pred_noise, x_start_pred, model_out = self._df_model_predictions(x_t, noise_levels)
 
+        # 确定 MSE 的目标
         if self.df_objective == "pred_noise":
             target = noise
         elif self.df_objective == "pred_x0":
@@ -985,27 +1001,46 @@ class DFGPT(GPT):
         elif self.df_objective == "pred_v":
             target = self._predict_v(x0, noise_levels, noise)
         else:
-            raise ValueError(f"unknown df_objective {self.df_objective}")
+            raise ValueError(f"unknown objective {self.df_objective}")
 
-        mse = F.mse_loss(model_out, target.detach(), reduction="none")               # (B, T, C)
-        loss_weight = self._compute_loss_weight(noise_levels)                        # (B, T)
-        loss_weight = loss_weight.unsqueeze(-1)                                      # (B, T, 1)
-        loss = (mse * loss_weight).mean()
-        # loss = 0
-
-        # TODO: 辅助交叉熵损失
-        scale = math.sqrt(self.config.n_embd)
-        pred_logits = self.lm_head(x_start_pred / scale) 
-
-        # 计算标准的 GPT 分类 Loss
+        # ------------------------------------------------------------------
+        # 4. 计算损失 (The "Recipe")
+        # ------------------------------------------------------------------
+        
+        # === A. Diffusion Loss (MSE) ===
+        # 负责几何空间的定位
+        mse = F.mse_loss(model_out, target.detach(), reduction="none")
+        loss_weight = self._compute_loss_weight(noise_levels).unsqueeze(-1)
+        diff_loss = (mse * loss_weight).mean()
+        
+        # === B. Auxiliary Classification Loss (CE) - 关键修改 ===
+        # AR-Diffusion 即使在扩散时也会计算 token_discrete_loss
+        # 核心逻辑：lm_head 是共享权重的 (wte)，它只认识纯 Token，不认识 Pos。
+        # 所以我们需要：预测的 x0 - 位置编码 -> 纯 Token 向量 -> 除以 scale -> lm_head
+        
+        pure_token_pred = x_start_pred - pos_emb_scaled  # 减去位置！
+        logits_input = pure_token_pred / self.scale           # 归一化！
+        
+        pred_logits = self.lm_head(logits_input)
         ce_loss = F.cross_entropy(pred_logits.view(-1, pred_logits.size(-1)), idx.view(-1))
 
-        # 3. 混合 Loss
-        # 给 CE Loss 一个权重 (lambda)，通常 0.1 或 1.0 都可以
-        # 这个 Loss 会提供极其鲜明的梯度，强迫模型把字"对准"
-        loss += 1 * ce_loss
+        # === C. Latent Regularization (tT Loss) - 防止数值爆炸 ===
+        # 对应 AR-Diffusion 中的 terms["tT_loss"]。
+        # 防止模型为了欺骗 CE Loss 而预测出数值极大的向量 (比如 60000)。
+        # 我们简单地惩罚预测出的 x0 的模长，迫使它保持在合理范围内。
+        
+        reg_loss = (x_start_pred ** 2).mean()
 
-        # keep API identical to GPT
+        # ------------------------------------------------------------------
+        # 5. 组合 Loss
+        # ------------------------------------------------------------------
+        # 建议权重：
+        # Diffusion Loss: 1.0 (基础物理引擎)
+        # CE Loss: 0.5 ~ 1.0 (语义方向盘)
+        # Reg Loss: 1e-4 ~ 1e-3 (防止数值爆炸的安全阀)
+        
+        loss = diff_loss + (0.5 * ce_loss) + (1e-3 * reg_loss)
+
         return None, loss
 
     @torch.no_grad()
@@ -1029,8 +1064,7 @@ class DFGPT(GPT):
         pos_emb = self.transformer.wpe(pos)
         
         # 必须乘 scale！
-        scale = math.sqrt(self.config.n_embd)
-        x0 = (tok_emb + pos_emb.unsqueeze(0)) * scale
+        x0 = (tok_emb + pos_emb.unsqueeze(0)) * self.scale
         # === DEBUG PRINT ===
         print(f"DEBUG: x0 mean: {x0.mean().item():.4f}, std: {x0.std().item():.4f}")
         print(f"DEBUG: x0 norm (magnitude): {x0.norm(dim=-1).mean().item():.4f}")
@@ -1051,7 +1085,7 @@ class DFGPT(GPT):
             # 如果是预测 noise，我们需要从 x_t (即 x0) 减去预测的 noise (应该是0) 恢复 x_start
             # 在 test_copy_ability 且 k=0 时，逻辑上 x_start_pred 应该就是结果
             predicted_emb = x_start_pred
-        pos_emb_scaled = self.transformer.wpe(pos).unsqueeze(0) * scale
+        pos_emb_scaled = self.transformer.wpe(pos).unsqueeze(0) * self.scale
         
         # 1. 还原纯 Token 向量
         pure_token_pred = x_start_pred - pos_emb_scaled
@@ -1074,11 +1108,10 @@ class DFGPT(GPT):
         print(f"DEBUG _decode_tokens: embedding has Inf={torch.isinf(embedding).any().item()}")
         
         # 1. 获取 Embedding 权重并缩放 (如果你在 forward 里乘了 scale，这里也要乘)
-        scale = math.sqrt(self.config.n_embd)
-        w = self.transformer.wte.weight * scale # (V, C)
+        w = self.transformer.wte.weight * self.scale # (V, C)
         
         print(f"DEBUG _decode_tokens: w shape={w.shape}, vocab_size={self.config.vocab_size}")
-        print(f"DEBUG _decode_tokens: w min={w.min().item():.4f}, max={w.max().item():.4f}")
+        print(f"DEBUG _decode_tokens: w min={w.min().item() / self.scale:.4f}, max={w.max().item() / self.scale:.4f}")
         
         # 2. 计算距离
         # embedding: (B, T, C)

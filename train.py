@@ -42,6 +42,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # tensorboard logging
 tensorboard_log = False # disabled by default
 tensorboard_log_dir = 'runs/owt'
+tensorboard_log_interval = 500 # log to tensorboard every N steps
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -304,12 +305,15 @@ while True:
             f"train CE {train_stats['ce']:.4f}, val CE {val_stats['ce']:.4f}"
         )
         if tensorboard_log and writer is not None:
-            writer.add_scalar("train/loss", train_stats['loss'], iter_num)
-            writer.add_scalar("val/loss", val_stats['loss'], iter_num)
-            writer.add_scalar("train/ce", train_stats['ce'], iter_num)
-            writer.add_scalar("val/ce", val_stats['ce'], iter_num)
-            writer.add_scalar("lr", lr, iter_num)
-            writer.add_scalar("mfu", running_mfu*100, iter_num) # convert to percentage
+            writer.add_scalar("eval/train_loss", train_stats['loss'], iter_num)
+            writer.add_scalar("eval/val_loss", val_stats['loss'], iter_num)
+            # only log ce separately if using Diffusion Forcing (otherwise ce == loss)
+            if isinstance(raw_model, DFGPT):
+                writer.add_scalar("eval/train_ce", train_stats['ce'], iter_num)
+                writer.add_scalar("eval/val_ce", val_stats['ce'], iter_num)
+            writer.add_scalar("eval/lr", lr, iter_num)
+            if running_mfu > 0:
+                writer.add_scalar("eval/mfu", running_mfu*100, iter_num) # convert to percentage
         if val_stats['loss'] < best_val_loss or always_save_checkpoint:
             best_val_loss = val_stats['loss']
             if iter_num > 0:
@@ -364,6 +368,13 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        
+        # log to tensorboard at specified interval
+        if tensorboard_log and writer is not None and iter_num % tensorboard_log_interval == 0:
+            writer.add_scalar("train/loss_step", lossf, iter_num)
+            writer.add_scalar("lr_step", lr, iter_num)
+            if running_mfu > 0:
+                writer.add_scalar("mfu_step", running_mfu*100, iter_num)
     iter_num += 1
     local_iter_num += 1
 
